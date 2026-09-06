@@ -171,6 +171,33 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     )
 }
 
+def window_threshold(label: str, settings: AutoSwitchSettings) -> float:
+    """The threshold that applies to one window.
+
+    ``threshold_5h`` / ``threshold_7d`` override ``threshold`` for the two
+    account-wide windows when set. Every other window (a per-model scoped
+    window named by ``autoswitch.model``) uses ``threshold``.
+    """
+    if label == "5h" and settings.threshold_5h is not None:
+        return settings.threshold_5h
+    if label == "7d" and settings.threshold_7d is not None:
+        return settings.threshold_7d
+    return settings.threshold
+
+
+def poll_threshold(settings: AutoSwitchSettings) -> float:
+    """The lowest threshold any window can trip — what the poll planner
+    should tighten cadence toward, so an early 5h line is watched as closely
+    as the account-wide one. Shared by the engine's pin and the switcher's
+    settings-file fallback so every surface plans the same cadence."""
+    lines = [settings.threshold]
+    if settings.threshold_5h is not None:
+        lines.append(settings.threshold_5h)
+    if settings.threshold_7d is not None:
+        lines.append(settings.threshold_7d)
+    return min(lines)
+
+
 _AUTOSWITCH_KEYS: dict[str, str] = {
     spec.field: spec.json_key
     for spec in SETTING_SPECS.values()
