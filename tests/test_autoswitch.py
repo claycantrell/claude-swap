@@ -6894,3 +6894,229 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+# --- weekly-first strategy, per-window thresholds, landing caps ---------------
+
+
+def _seed3(h: EngineHarness) -> EngineHarness:
+    h.seed(1, "a@example.com")
+    h.seed(2, "b@example.com")
+    h.seed(3, "c@example.com")
+    h.make_live("a@example.com", 1)
+    return h
+
+
+def _no_switch_reasons(h: EngineHarness) -> list[str]:
+    return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+
+class TestWeeklyFirstStrategy:
+    """`weekly-first` = consume-first's target choice with `best`'s trigger.
+
+    It ranks candidates by soonest weekly reset, but never moves while the
+    active account is below the threshold.
+    """
+
+    def test_below_threshold_stays_even_when_a_peer_resets_sooner(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first"))
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),    # active, healthy
+            "2": _usage7(10, 10, _R_SOON),     # resets sooner — consume-first would move
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _no_switch_reasons(h) == ["below-threshold"]
+
+    def test_at_threshold_picks_soonest_weekly_reset_not_most_headroom(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first"))
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),    # active, over the 90 threshold
+            "2": _usage7(50, 40, _R_SOON),     # less headroom, resets soonest
+            "3": _usage7(10, 10, _R_LATEST),   # most headroom, resets latest
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_unknown_weekly_reset_sorts_last(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first"))
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(10, 10),              # no resets_at on the weekly window
+            "3": _usage7(50, 40, _R_LATEST),   # known reset beats unknown
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_no_hysteresis_needed_to_leave_at_threshold(self, temp_home):
+        """`best` refuses a target that does not beat the active account by
+        `hysteresis_pct`. weekly-first does not: the landing gate already
+        keeps the target under the threshold, so the two cannot flap."""
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first", hysteresis_pct=10))
+        outcome = h.tick_with_usage({
+            "1": _usage7(91, 20, _R_LATER),    # 9 pts headroom
+            "2": _usage7(85, 40, _R_SOON),     # 15 pts: only 6 better than active
+            "3": _usage7(85, 40, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
+class TestLandingCaps:
+    """`landingMax5hPct` / `landingMax7dPct`: never switch ONTO an account
+    whose own 5h or 7d window is above the cap. Every trigger, every strategy.
+    """
+
+    def test_five_hour_cap_skips_the_soonest_reset(self, temp_home):
+        h = _seed3(EngineHarness(
+            temp_home, strategy="weekly-first", landing_max_5h_pct=90
+        ))
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(92, 10, _R_SOON),     # soonest, but 5h over the cap
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_seven_day_cap_is_judged_on_the_weekly_window_itself(self, temp_home):
+        """Headroom is `100 - max(5h, 7d)`, so a 0% 5h / 96% 7d account and a
+        96% 5h / 0% 7d account look identical to `best`. The cap reads the
+        weekly window on its own."""
+        h = _seed3(EngineHarness(
+            temp_home, strategy="weekly-first", threshold=99, landing_max_7d_pct=95
+        ))
+        outcome = h.tick_with_usage({
+            "1": _usage7(99, 20, _R_LATER),
+            "2": _usage7(0, 96, _R_SOON),      # weekly over the cap
+            "3": _usage7(0, 50, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_caps_hold_on_the_at_limit_escape(self, temp_home):
+        """The escape used to accept any headroom above zero. With a cap set,
+        an account over it is not a landing even when the active account is
+        hard-blocked: with nowhere allowed to go, the tick is BLOCKED and the
+        engine waits for a reset instead of moving the 429 to another account.
+        """
+        h = EngineHarness(temp_home, strategy="best", landing_max_5h_pct=90)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 20, _R_LATER),   # at its limit
+            "2": _usage7(95, 10, _R_SOON),     # 5 pts left, over the cap
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_caps_apply_under_best_too(self, temp_home):
+        """The caps are not a weekly-first feature. Under `best`, the only
+        candidate is over the 5h cap, so a proactive tick has nowhere to go."""
+        h = EngineHarness(temp_home, strategy="best", landing_max_5h_pct=90)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(91, 5),               # 9 pts headroom, but 5h over the cap
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_cap_off_by_default(self, temp_home):
+        """100 = no cap: a 96% account is still a legal at-limit landing, as
+        it was before the setting existed."""
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 20),
+            "2": _usage7(96, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
+class TestPerWindowThresholds:
+    """`threshold5h` / `threshold7d` override `threshold` for that one window.
+    A switch fires when ANY window reaches its own line."""
+
+    def test_five_hour_override_fires_before_the_account_wide_threshold(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, threshold=99, threshold_5h=95))
+        outcome = h.tick_with_usage({
+            "1": _usage7(96, 20),              # 5h over its 95 line; 7d fine
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_weekly_window_still_follows_the_account_wide_threshold(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, threshold=99, threshold_5h=95))
+        outcome = h.tick_with_usage({
+            "1": _usage7(50, 96),              # 7d at 96 < 99: no override for it
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[0].reason == "below-threshold"
+        assert reasons[0].detail == "96% < 99%"
+
+    def test_weekly_override_lets_the_weekly_window_run_closer_to_the_wall(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, threshold=95, threshold_7d=99))
+        assert h.tick_with_usage({
+            "1": _usage7(50, 97),              # would trip a flat 95; not the 99 override
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        }) is TickOutcome.NO_ACTION
+        h.events.clear()
+        assert h.tick_with_usage({
+            "1": _usage7(50, 99),
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        }) is TickOutcome.SWITCHED
+
+    def test_landing_gate_uses_the_same_per_window_lines(self, temp_home):
+        """A target is refused if ANY of its windows is at its own threshold
+        (it would re-trigger next tick). With a weekly override at 99, a
+        candidate at 97% weekly is a legal landing even though the
+        account-wide threshold is 95. (Under `best` the hysteresis margin
+        would still refuse a 3-point candidate; weekly-first has no such
+        margin, which is the strategy this override is for.)"""
+        h = EngineHarness(
+            temp_home, strategy="weekly-first", threshold=95, threshold_7d=99
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(96, 20),
+            "2": _usage7(10, 97),              # weekly 97: under 99, legal
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_without_the_override_that_landing_is_refused(self, temp_home):
+        h = EngineHarness(temp_home, strategy="weekly-first", threshold=95)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(96, 20),
+            "2": _usage7(10, 97),              # weekly 97 >= 95: would re-trigger
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_poll_planner_watches_the_lowest_line(self, temp_home):
+        from claude_swap.autoswitch import poll_threshold
+
+        assert poll_threshold(AutoSwitchSettings(threshold=99)) == 99
+        assert poll_threshold(AutoSwitchSettings(threshold=99, threshold_5h=95)) == 95
+        assert poll_threshold(AutoSwitchSettings(threshold=90, threshold_7d=99)) == 90
