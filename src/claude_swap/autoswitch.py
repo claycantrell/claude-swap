@@ -51,7 +51,13 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    poll_threshold,
+    window_threshold,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -557,32 +563,6 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
-def window_threshold(label: str, settings: AutoSwitchSettings) -> float:
-    """The threshold that applies to one window.
-
-    ``threshold_5h`` / ``threshold_7d`` override ``threshold`` for the two
-    account-wide windows when set. Every other window (a per-model scoped
-    window named by ``autoswitch.model``) uses ``threshold``.
-    """
-    if label == "5h" and settings.threshold_5h is not None:
-        return settings.threshold_5h
-    if label == "7d" and settings.threshold_7d is not None:
-        return settings.threshold_7d
-    return settings.threshold
-
-
-def poll_threshold(settings: AutoSwitchSettings) -> float:
-    """The lowest threshold any window can trip — what the poll planner
-    should tighten cadence toward, so an early 5h line is watched as closely
-    as the account-wide one."""
-    candidates = [settings.threshold]
-    if settings.threshold_5h is not None:
-        candidates.append(settings.threshold_5h)
-    if settings.threshold_7d is not None:
-        candidates.append(settings.threshold_7d)
-    return min(candidates)
-
-
 def _windows_at_threshold(
     usage: dict | str | None,
     models: Sequence[str],
@@ -604,25 +584,34 @@ def _windows_at_threshold(
 
 
 def _within_landing_caps(
-    usage: dict | str | None, settings: AutoSwitchSettings
+    usage: dict | str | None,
+    models: Sequence[str],
+    settings: AutoSwitchSettings,
 ) -> bool:
     """Whether an account may be switched ONTO.
 
-    Judged on its own 5h and 7d windows, not on the binding max: a 0% 5h /
+    Judged on each of its own windows, not on the binding max: a 0% 5h /
     96% 7d account has the same headroom as a 96% 5h / 0% 7d one, but only
-    the second is about to refill. A window missing from the snapshot does
+    the second is about to refill. Reads the same window source as every
+    other decision (``oauth.relevant_windows``, same ``models``): the 5h
+    window against ``landing_max_5h_pct``, and the 7d window AND every
+    per-model scoped window named by ``autoswitch.model`` against
+    ``landing_max_7d_pct`` — scoped windows are weekly, and a Fable-pinned
+    session landing on an account whose Fable window is spent is the same
+    failure the cap exists to stop. A window missing from the snapshot does
     not fail the cap — the caller has already required readable headroom.
-    Reads the same window source as every other decision
-    (``oauth.relevant_windows``); per-model scoped windows have no cap.
     """
-    caps = {"5h": settings.landing_max_5h_pct, "7d": settings.landing_max_7d_pct}
     if not isinstance(usage, dict):
         return True
-    return all(
-        pct <= caps[label]
-        for label, pct, _resets_at in oauth.relevant_windows(usage)
-        if label in caps
-    )
+    for label, pct, _resets_at in oauth.relevant_windows(usage, models):
+        cap = (
+            settings.landing_max_5h_pct
+            if label == "5h"
+            else settings.landing_max_7d_pct
+        )
+        if pct > cap:
+            return False
+    return True
 
 
 def _binding_recovery_ts(
@@ -1060,23 +1049,23 @@ class AutoSwitchEngine:
             active_usage = usage.get(current)
             if not _windows_at_threshold(active_usage, self._models, settings):
                 if settings.strategy != "consume-first":
-                    # Report the binding window against ITS threshold, so a
-                    # 5h line below the account-wide one reads correctly.
-                    # (headroom is known here, so at least one window exists;
-                    # the default only guards the type.)
-                    binding_label, _pct, _reset = max(
+                    # Report the window CLOSEST to its own line — the one
+                    # that will fire next — not the highest percentage: with
+                    # a 5h line at 95 and a weekly line at 99, a 5h at 94
+                    # is nearer to switching than a 7d at 96. headroom is
+                    # known here, so at least one window exists.
+                    closest_label, closest_pct, _reset = max(
                         oauth.relevant_windows(active_usage, self._models),
-                        key=lambda w: w[1],
-                        default=("", 0.0, None),
+                        key=lambda w: w[1] - window_threshold(w[0], settings),
                     )
-                    line = window_threshold(binding_label, settings)
+                    line = window_threshold(closest_label, settings)
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
                             detail=(
-                                f"{pct_label(utilization)}% < {pct_label(line)}%"
+                                f"{pct_label(closest_pct)}% < {pct_label(line)}%"
                             ),
                         )
                     )
@@ -1365,15 +1354,26 @@ class AutoSwitchEngine:
                 h is not None and h <= 0 for h in candidate_headrooms
             )
             if not truly_exhausted:
-                self._emit(
-                    NoSwitchEvent(
-                        reason="no-qualifying-candidate",
-                        detail=(
-                            "no candidate is below the threshold and better "
-                            "than the active account by the hysteresis "
-                            "margin, or usage is unreadable this tick"
-                        ),
+                # Name the caps when they are what blocked the tick, so the
+                # log says why a healthy-looking peer was not taken.
+                over_caps = [
+                    n
+                    for n in oauth_candidates
+                    if (headroom.get(n) or 0) > 0
+                    and not _within_landing_caps(usage.get(n), self._models, settings)
+                ]
+                detail = (
+                    "no candidate is below the threshold and better "
+                    "than the active account by the hysteresis "
+                    "margin, or usage is unreadable this tick"
+                )
+                if over_caps:
+                    detail += (
+                        f"; {len(over_caps)} candidate(s) over the landing "
+                        "caps (landingMax5hPct / landingMax7dPct)"
                     )
+                self._emit(
+                    NoSwitchEvent(reason="no-qualifying-candidate", detail=detail)
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
@@ -1936,10 +1936,16 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
-            if not _within_landing_caps(usage.get(num), settings):
-                # Every trigger, every strategy. Landing on an account that
-                # is itself nearly spent moves the rate limit rather than
-                # avoiding it — the at-limit escape included.
+            if trigger != "failover" and not _within_landing_caps(
+                usage.get(num), self._models, settings
+            ):
+                # Every strategy, and every trigger but failover. Landing on
+                # an account that is itself nearly spent moves the rate limit
+                # rather than avoiding it — the at-limit escape included: a
+                # blocked account waits for its own reset instead. Failover
+                # is different: the active account is dead or unreadable, so
+                # there is nothing to wait for, and any account with headroom
+                # is a strict improvement over one that cannot work at all.
                 continue
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if by_weekly_reset else None
@@ -2008,9 +2014,12 @@ class AutoSwitchEngine:
                 elif weekly_first:
                     # At the threshold, any account that passed the landing
                     # gate and the caps is a sound landing; the key below
-                    # orders them by weekly reset. No hysteresis: the gate
-                    # already separates target and active by the full
-                    # threshold-to-landing distance.
+                    # orders them by weekly reset. No headroom hysteresis: the
+                    # strategy ranks by reset, not by headroom, so a headroom
+                    # margin would contradict its own ordering. The landing
+                    # caps are its margin — without them a target just under
+                    # the line can be taken and re-trigger soon after (a few
+                    # swaps, not a runaway: the no-return bar still applies).
                     pass
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -2054,9 +2063,14 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif by_weekly_reset:
+            elif consume_first or (weekly_first and trigger == "proactive"):
                 # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
+                # headroom breaks ties, then sequence order. For weekly-first
+                # this key is PROACTIVE-ONLY: the at-limit and failover
+                # escapes skip the landing gate, and ranking an escape by
+                # reset would land on the most-consumed account — the exact
+                # failure the caps exist to stop. Escapes rank by headroom.
+                # (consume-first keeps its existing behaviour here; #305/#313.)
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
